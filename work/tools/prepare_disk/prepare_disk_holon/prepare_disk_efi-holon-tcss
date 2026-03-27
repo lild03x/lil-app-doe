@@ -1,0 +1,191 @@
+#!/bin/bash
+
+# stop on error
+set -e
+
+# Preparing disk for passengera media-server
+#
+# Usage:   ./prepare_disk --dev <device>                # block device for installation
+#                         --bs <BackService image>      # path to image
+#                         --fw <firmware image>         # path to image
+#                         --svm <services VM image>     # path to image
+#                         --tcss <TCSS KVM image>       # path to image
+#                         [ --media <path to media> ]   # path to dir
+
+mountbasedir="/tmp/prepare_disk_mnt"
+
+unset dev
+unset bs
+unset fw
+unset svm
+unset tcss
+
+# Parse parameters
+while [[ $# -gt 0 ]]
+do
+        case $1 in
+                -d|--dev)
+                        dev=$2
+                        shift
+                        ;;
+                -b|--bs)
+                        bs=$2
+                        shift
+                        ;;
+                -f|--fw)
+                        fw=$2
+                        shift
+                        ;;
+                -s|--svm)
+                        svm=$2
+                        shift
+                        ;;
+                -t|--tcss)
+                        tcss=$2
+                        shift
+                        ;;
+                -*)
+                        >&2 echo "Unknown option $1"
+                        exit 1
+                        ;;
+                *)
+                        >&2 echo "Unknown value $1"
+                        exit 1
+                        ;;
+        esac
+        shift
+done
+
+if [[ -e ${mountbasedir} ]]
+then
+        echo "Error: Temporary dir ${mountbasedir} exists already!"
+        exit 1
+fi
+
+if [[ ! -e ${dev} || ! -e ${bs} || ! -e ${fw} || ! -e ${svm} || ! -e ${tcss} ]]
+then
+        >&2 echo "
+Usage:
+  prepare_disk --dev <device> (${dev})
+               --bs <BackService image> (${bs})
+               --fw <firmware image> (${fw})
+               --svm <services VM image> (${svm})
+               --tcss <TCSS KVM image> (${tcss})
+               [ --media <path to media> ]"
+        exit 1
+fi
+
+if grep -q "${dev}" /proc/mounts
+then
+        >&2 echo "Device ${dev} already mounted"
+        >&2 echo "MAKE SURE YOU HAVE SPECIFIED THE RIGHT DEVICE!!!"
+        exit 1
+fi
+
+# TODO: Make sure there are no partitions labeled as esp, firmware, ..., media present (except target device)
+
+echo "Preparing disk with Passengera server software (${dev})"
+sleep 3
+
+echo "Initial FS cleanup"
+wipefs --all ${dev}
+
+echo "Creating partitions"
+LC_NUMERIC=C
+parted "${dev}" --script \
+        mklabel gpt \
+        mkpart esp fat32 2048s 256MiB \
+        set 1 esp on \
+        mkpart firmware ext4 256MiB 3GiB \
+        mkpart log ext4 3GiB 5GiB \
+        mkpart config ext4 5GiB 5184MiB \
+        mkpart backup ext4 5184MiB 20GiB \
+        mkpart backservice ext4 20GiB 24GiB \
+        mkpart portal ext4 24GiB 40GiB \
+        mkpart tcss ext4 40GiB 72GiB \
+        mkpart media ext4 72GiB 100%
+
+partprobe "${dev}"
+sleep 2
+
+echo "Formating partitions"
+mkfs.vfat    -n esp         /dev/disk/by-partlabel/esp
+mkfs.ext4 -F -L firmware    /dev/disk/by-partlabel/firmware
+mkfs.ext4 -F -L log         /dev/disk/by-partlabel/log
+mkfs.ext4 -F -L config      /dev/disk/by-partlabel/config
+mkfs.ext4 -F -L backup      /dev/disk/by-partlabel/backup
+mkfs.ext4 -F -L backservice /dev/disk/by-partlabel/backservice
+mkfs.ext4 -F -L media       /dev/disk/by-partlabel/media
+
+sync
+lsblk "${dev}" -o name,partlabel,label,fstype,size
+
+echo "Mounting partitions"
+mkdir -p ${mountbasedir}/firmware
+mkdir -p ${mountbasedir}/log
+mkdir -p ${mountbasedir}/config
+mkdir -p ${mountbasedir}/backup
+mkdir -p ${mountbasedir}/backservice
+mkdir -p ${mountbasedir}/media
+
+mount -L firmware    ${mountbasedir}/firmware
+mount -L log         ${mountbasedir}/log
+mount -L config      ${mountbasedir}/config
+mount -L backup      ${mountbasedir}/backup
+mount -L backservice ${mountbasedir}/backservice
+mount -L media       ${mountbasedir}/media
+
+echo "Preparing backup"
+cp -axLv ${bs} ${fw} ${svm} ${tcss} ${mountbasedir}/backup
+ln -sfv ${bs##*/}  ${mountbasedir}/backup/backservice.tbz2
+ln -sfv ${fw##*/}  ${mountbasedir}/backup/firmware.tbz2
+ln -sfv ${svm##*/} ${mountbasedir}/backup/portal-a64_ro.qcow2
+ln -sfv ${tcss##*/} ${mountbasedir}/backup/tcss.qcow2
+
+if [[ -n ${media} ]]
+then
+        echo "Copying media"
+        rsync -axHAX root@"$server":/opt/disk/passengera.systems/media/ ${mountbasedir}/media
+fi
+echo "Extracting backservice, log and config"
+tar xf ${mountbasedir}/backup/backservice.tbz2 --use-compress-program lbzip2 -C ${mountbasedir} backservice log config
+
+echo "Extracting firmware"
+tar xf ${mountbasedir}/backup/firmware.tbz2 --use-compress-program lbzip2 -C ${mountbasedir} firmware
+
+echo "Extracting Services VM"
+qemu-img convert -O raw ${mountbasedir}/backup/portal-a64_ro.qcow2 /dev/disk/by-partlabel/portal
+
+echo "Extracting TCSS VM"
+qemu-img convert -O raw ${mountbasedir}/backup/tcss.qcow2 /dev/disk/by-partlabel/tcss
+
+echo "Installing grub"
+mkdir -p     ${mountbasedir}/firmware/boot/efi
+mount -L esp ${mountbasedir}/firmware/boot/efi
+
+## run grub-install in systemd-nspawned environment
+# grub install info:
+# --removable
+#   create general boot directory esp/EFI/BOOT
+# --no-nvram
+#   do not update (EFI) nvram on current computer
+systemd-nspawn --directory ${mountbasedir}/firmware \
+               --timezone=off \
+               --bind ${dev} \
+               --bind $(readlink -f /dev/disk/by-partlabel/esp) \
+               --bind $(readlink -f /dev/disk/by-partlabel/firmware) \
+               grub-install --target=x86_64-efi --efi-directory=/boot/efi --recheck --removable --no-nvram
+
+echo "Unmouting partitions"
+umount -l ${mountbasedir}/firmware/boot/efi
+umount -l ${mountbasedir}/firmware
+umount -l ${mountbasedir}/log
+umount -l ${mountbasedir}/config
+umount -l ${mountbasedir}/backup
+umount -l ${mountbasedir}/backservice
+umount -l ${mountbasedir}/media
+
+rm -r ${mountbasedir}
+
+echo 1 > /sys/block/${dev##*/}/device/delete
+echo "Device ${dev} can now be safely removed"
