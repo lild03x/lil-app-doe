@@ -4,7 +4,7 @@ This repository contains a collection of useful scripts for both personal and wo
 
 ## Structure
 - `/work/`: Scripts for professional/work-related tasks.
-- `/lildoe-personal/`: Scripts for personal use.
+- `/personal-lil/`: Scripts for personal use.
 
 ## Usage
 Feel free to add new scripts, organize them into subfolders, and document their usage here.
